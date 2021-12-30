@@ -8,11 +8,11 @@ import random
 import shutil
 import time
 import warnings
+from functools import partial
 
 import torch
 import torch.backends.cudnn as cudnn
 import torch.distributed as dist
-import torch.multiprocessing as mp
 import torch.nn as nn
 import torch.nn.parallel
 import torch.optim
@@ -24,16 +24,11 @@ import torchvision.transforms as transforms
 import moco.builder
 import moco.loader
 
-model_names = sorted('yolov5' + i for i in ['n', 's', 'm', 'l', 'x'])
-
 parser = argparse.ArgumentParser(description='PyTorch ImageNet Training')
 parser.add_argument('data', metavar='DIR',
                     help='path to dataset')
-parser.add_argument('-a', '--arch', metavar='ARCH', default='yolov5n',
-                    choices=model_names,
-                    help='model architecture: ' +
-                         ' | '.join(model_names) +
-                         ' (default: resnet50)')
+parser.add_argument('-a', '--arch', metavar='ARCH',
+                    default='/home/yyt/.cache/torch/hub/ultralytics_yolov5_master/yolov5n.pt')
 parser.add_argument('-j', '--workers', default=32, type=int, metavar='N',
                     help='number of data loading workers (default: 32)')
 parser.add_argument('--epochs', default=200, type=int, metavar='N',
@@ -60,21 +55,13 @@ parser.add_argument('--resume', default='', type=str, metavar='PATH',
                     help='path to latest checkpoint (default: none)')
 parser.add_argument('--world-size', default=-1, type=int,
                     help='number of nodes for distributed training')
-parser.add_argument('--rank', default=-1, type=int,
-                    help='node rank for distributed training')
-parser.add_argument('--dist-url', default='tcp://224.66.41.62:23456', type=str,
-                    help='url used to set up distributed training')
 parser.add_argument('--dist-backend', default='nccl', type=str,
                     help='distributed backend')
 parser.add_argument('--seed', default=None, type=int,
                     help='seed for initializing training. ')
 parser.add_argument('--gpu', default=None, type=int,
                     help='GPU id to use.')
-parser.add_argument('--multiprocessing-distributed', action='store_true',
-                    help='Use multi-processing distributed training to launch '
-                         'N processes per node, which has N GPUs. This is the '
-                         'fastest way to use PyTorch for either single node or '
-                         'multi node data parallel training')
+parser.add_argument('--local_rank', type=int, default=-1, help='DDP parameter, do not modify')
 
 # moco specific configs:
 parser.add_argument('--moco-dim', default=128, type=int,
@@ -94,6 +81,8 @@ parser.add_argument('--aug-plus', action='store_true',
 parser.add_argument('--cos', action='store_true',
                     help='use cosine lr schedule')
 
+LOCAL_RANK = int(os.getenv('LOCAL_RANK', -1))
+
 
 def main():
     args = parser.parse_args()
@@ -112,55 +101,34 @@ def main():
         warnings.warn('You have chosen a specific GPU. This will completely '
                       'disable data parallelism.')
 
-    if args.dist_url == "env://" and args.world_size == -1:
+    if args.world_size == -1:
         args.world_size = int(os.environ["WORLD_SIZE"])
 
-    args.distributed = args.world_size > 1 or args.multiprocessing_distributed
+    args.distributed = args.world_size > 1
 
     ngpus_per_node = torch.cuda.device_count()
-    if args.multiprocessing_distributed:
-        # Since we have ngpus_per_node processes per node, the total world_size
-        # needs to be adjusted accordingly
-        args.world_size = ngpus_per_node * args.world_size
-        # Use torch.multiprocessing.spawn to launch distributed processes: the
-        # main_worker process function
-        mp.spawn(main_worker, nprocs=ngpus_per_node, args=(ngpus_per_node, args))
-    else:
-        # Simply call main_worker function
-        main_worker(args.gpu, ngpus_per_node, args)
+    if args.distributed:
+        main_worker(LOCAL_RANK, ngpus_per_node, args)
 
 
 def main_worker(gpu, ngpus_per_node, args):
     args.gpu = gpu
 
+    if args.gpu is not None:
+        print("Use GPU: {} for training".format(args.gpu))
+
     # suppress printing if not master
-    if args.multiprocessing_distributed and args.gpu != 0:
+    if args.gpu != 0:
         def print_pass(*args):
             pass
 
         builtins.print = print_pass
-
-    if args.gpu is not None:
-        print("Use GPU: {} for training".format(args.gpu))
-
-    if args.distributed:
-        if args.dist_url == "env://" and args.rank == -1:
-            args.rank = int(os.environ["RANK"])
-        if args.multiprocessing_distributed:
-            # For multiprocessing distributed training, rank needs to be the
-            # global rank among all the processes
-            args.rank = args.rank * ngpus_per_node + gpu
-        dist.init_process_group(backend=args.dist_backend, init_method=args.dist_url,
-                                world_size=args.world_size, rank=args.rank)
+    dist.init_process_group(backend=args.dist_backend)
     # create model
     print("=> creating model '{}'".format(args.arch))
-    yolo_model = torch.hub.load('ultralytics/yolov5', args.arch)  # or yolov5m, yolov5l, yolov5x, custom
-    yolo_model = yolo_model.model.model[:9]
-    yolo_model.add_module('head', nn.Sequential(nn.AdaptiveMaxPool2d((1, 1)), nn.Flatten()))
-    yolo_model.add_module('fc', nn.Linear(512, 128))
 
     model = moco.builder.MoCo(
-        yolo_model,
+        partial(build_yolov5_backbone, arch=args.arch),
         args.moco_dim, args.moco_k, args.moco_m, args.moco_t, args.mlp)
     print(model)
 
@@ -176,12 +144,7 @@ def main_worker(gpu, ngpus_per_node, args):
             # ourselves based on the total number of GPUs we have
             args.batch_size = int(args.batch_size / ngpus_per_node)
             args.workers = int((args.workers + ngpus_per_node - 1) / ngpus_per_node)
-            model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
-        else:
-            model.cuda()
-            # DistributedDataParallel will divide and allocate batch_size to all
-            # available GPUs if device_ids are not set
-            model = torch.nn.parallel.DistributedDataParallel(model)
+            model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], output_device=[args.gpu])
     elif args.gpu is not None:
         torch.cuda.set_device(args.gpu)
         model = model.cuda(args.gpu)
@@ -268,8 +231,7 @@ def main_worker(gpu, ngpus_per_node, args):
         # train for one epoch
         train(train_loader, model, criterion, optimizer, epoch, args)
 
-        if not args.multiprocessing_distributed or (args.multiprocessing_distributed
-                                                    and args.rank % ngpus_per_node == 0):
+        if LOCAL_RANK % ngpus_per_node == 0:
             save_checkpoint({
                 'epoch': epoch + 1,
                 'arch': args.arch,
@@ -393,13 +355,31 @@ def accuracy(output, target, topk=(1,)):
 
         _, pred = output.topk(maxk, 1, True, True)
         pred = pred.t()
-        correct = pred.eq(target.view(1, -1).expand_as(pred))
+        correct = pred.eq(target.reshape(1, -1).expand_as(pred))
 
         res = []
         for k in topk:
-            correct_k = correct[:k].view(-1).float().sum(0, keepdim=True)
+            correct_k = correct[:k].reshape(-1).float().sum(0, keepdim=True)
             res.append(correct_k.mul_(100.0 / batch_size))
         return res
+
+
+def build_yolov5_backbone(arch='yolov5s', num_classes=128):
+    model = torch.hub.load('/home/yyt/.cache/torch/hub/ultralytics_yolov5_master/', arch,
+                           source='local', device=torch.device('cpu'))  # or yolov5m, yolov5l, yolov5x, custom
+    model = model.model.model[:9]
+    model.add_module('head', nn.Sequential(nn.AdaptiveMaxPool2d((1, 1)), nn.Flatten()))
+    model.add_module('fc', nn.Linear(512, num_classes))
+    for m in model.modules():
+        t = type(m)
+        if t is nn.Conv2d:
+            nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+        elif t is nn.BatchNorm2d:
+            m.eps = 1e-5
+            m.momentum = 0.1
+        elif t in [nn.Hardswish, nn.LeakyReLU, nn.ReLU, nn.ReLU6, nn.SiLU]:
+            m.inplace = True
+    return model
 
 
 if __name__ == '__main__':

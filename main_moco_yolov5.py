@@ -379,6 +379,8 @@ def build_yolov5_backbone(arch='yolov5s', num_classes=128):
             m.momentum = 0.1
         elif t in [nn.Hardswish, nn.LeakyReLU, nn.ReLU, nn.ReLU6, nn.SiLU]:
             m.inplace = True
+    for k, v in model.named_parameters():
+        v.requires_grad = True
     return model
 
 
